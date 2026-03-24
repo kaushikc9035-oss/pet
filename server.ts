@@ -19,39 +19,11 @@ const UPLOADS_DIR = path.join(__dirname, "uploads");
 // In-memory database fallback for Vercel/Serverless
 let memoryDB = { users: [], lostPets: [], foundPets: [] };
 
-// Ensure data and uploads directories exist (only on local/persistent servers)
-if (process.env.NODE_ENV !== "production" || !process.env.VERCEL) {
-  if (!fs.existsSync(path.join(__dirname, "data"))) {
-    fs.mkdirSync(path.join(__dirname, "data"));
-  }
-  if (!fs.existsSync(UPLOADS_DIR)) {
-    fs.mkdirSync(UPLOADS_DIR);
-  }
-  if (!fs.existsSync(DATA_FILE)) {
-    fs.writeFileSync(DATA_FILE, JSON.stringify(memoryDB));
-  } else {
-    memoryDB = JSON.parse(fs.readFileSync(DATA_FILE, "utf-8"));
-  }
-}
-
-// Multer setup - Use memory storage for Vercel
-const storage = process.env.VERCEL 
-  ? multer.memoryStorage() 
-  : multer.diskStorage({
-      destination: (req, file, cb) => {
-        cb(null, UPLOADS_DIR);
-      },
-      filename: (req, file, cb) => {
-        cb(null, Date.now() + "-" + file.originalname);
-      },
-    });
-
-const upload = multer({ storage });
-
 // Database helpers
 const readDB = () => {
   if (process.env.VERCEL) return memoryDB;
   try {
+    if (!fs.existsSync(DATA_FILE)) return memoryDB;
     return JSON.parse(fs.readFileSync(DATA_FILE, "utf-8"));
   } catch (e) {
     return memoryDB;
@@ -62,6 +34,8 @@ const writeDB = (data: any) => {
   memoryDB = data;
   if (!process.env.VERCEL) {
     try {
+      const dir = path.dirname(DATA_FILE);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
       fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
     } catch (e) {
       console.error("Failed to write to disk:", e);
@@ -69,17 +43,25 @@ const writeDB = (data: any) => {
   }
 };
 
-export const app = express();
-export const httpServer = createServer(app);
-export const io = new Server(httpServer, {
-  cors: {
-    origin: "*",
-  },
-});
-
+const app = express();
 app.use(cors());
 app.use(express.json());
 app.use("/uploads", express.static(UPLOADS_DIR));
+
+// Multer setup - Use memory storage for Vercel
+const storage = process.env.VERCEL 
+  ? multer.memoryStorage() 
+  : multer.diskStorage({
+      destination: (req, file, cb) => {
+        if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+        cb(null, UPLOADS_DIR);
+      },
+      filename: (req, file, cb) => {
+        cb(null, Date.now() + "-" + file.originalname);
+      },
+    });
+
+const upload = multer({ storage });
 
 // Auth Middleware
 const authenticate = (req: any, res: any, next: any) => {
@@ -94,7 +76,9 @@ const authenticate = (req: any, res: any, next: any) => {
   }
 };
 
-// --- Auth Routes ---
+// --- API Routes ---
+app.get("/api/health", (req, res) => res.json({ status: "ok", env: process.env.VERCEL ? "vercel" : "local" }));
+
 app.post("/api/auth/signup", async (req, res) => {
   const { email, password, name } = req.body;
   const db = readDB();
@@ -120,13 +104,11 @@ app.post("/api/auth/login", async (req, res) => {
   res.json({ token, user: { id: user.id, email: user.email, name: user.name } });
 });
 
-// --- Pet Routes ---
 app.post("/api/pets/report", authenticate, upload.array("images", 5), (req: any, res) => {
   const { type, petType, petName, breed, color, location, lat, lng, dateTime, contact, urgency } = req.body;
   
   let images: string[] = [];
   if (process.env.VERCEL) {
-    // Convert buffers to base64 for Vercel
     images = (req.files as any[]).map(f => `data:${f.mimetype};base64,${f.buffer.toString("base64")}`);
   } else {
     images = (req.files as Express.Multer.File[]).map(f => `/uploads/${f.filename}`);
@@ -154,14 +136,12 @@ app.post("/api/pets/report", authenticate, upload.array("images", 5), (req: any,
   const collection = type === "lost" ? "lostPets" : "foundPets";
   db[collection].push(newPet);
   
-  // Simple Matching Logic
   const otherCollection = type === "lost" ? "foundPets" : "lostPets";
   const matches = db[otherCollection].filter((p: any) => {
     const sameType = p.petType.toLowerCase() === petType.toLowerCase();
     const sameBreed = p.breed.toLowerCase() === breed.toLowerCase();
-    // Proximity check (rough)
     const dist = Math.sqrt(Math.pow(p.lat - lat, 2) + Math.pow(p.lng - lng, 2));
-    return sameType && (sameBreed || dist < 0.1); // 0.1 deg is roughly 11km
+    return sameType && (sameBreed || dist < 0.1);
   });
 
   writeDB(db);
@@ -205,50 +185,28 @@ app.use("/api", (err: any, req: any, res: any, next: any) => {
   res.status(500).json({ error: "Internal Server Error", details: err.message });
 });
 
-// --- Socket.io Chat ---
-io.on("connection", (socket) => {
-  console.log("User connected:", socket.id);
-  
-  socket.on("join_room", (roomId) => {
-    socket.join(roomId);
+// --- Local Development Setup ---
+if (process.env.NODE_ENV !== "production" || !process.env.VERCEL) {
+  const httpServer = createServer(app);
+  const io = new Server(httpServer, { cors: { origin: "*" } });
+
+  io.on("connection", (socket) => {
+    socket.on("join_room", (roomId) => socket.join(roomId));
+    socket.on("send_message", (data) => io.to(data.roomId).emit("receive_message", data));
   });
 
-  socket.on("send_message", (data) => {
-    io.to(data.roomId).emit("receive_message", data);
-  });
-
-  socket.on("disconnect", () => {
-    console.log("User disconnected");
-  });
-});
-
-async function startServer() {
-  // --- Vite Middleware ---
-  if (process.env.NODE_ENV !== "production") {
+  const startLocalServer = async () => {
     const { createServer: createViteServer } = await import("vite");
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
+    const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
     app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
-    app.get("*", (req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
-    });
-  }
-
-  const PORT = process.env.PORT || 3000;
-  
-  // Only listen if not running as a serverless function (e.g., on Vercel)
-  if (process.env.NODE_ENV !== "production" || !process.env.VERCEL) {
+    
+    const PORT = process.env.PORT || 3000;
     httpServer.listen(PORT, "0.0.0.0", () => {
-      console.log(`Server running on http://localhost:${PORT}`);
+      console.log(`Local server running on http://localhost:${PORT}`);
     });
-  }
+  };
+  
+  startLocalServer();
 }
-
-startServer();
 
 export default app;
