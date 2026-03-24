@@ -1,0 +1,7 @@
+{
+  "name": "PetFinder",
+  "description": "A full-stack application to help lost pets find their way back home.",
+  "requestFramePermissions": [
+    "geolocation"
+  ]
+}
