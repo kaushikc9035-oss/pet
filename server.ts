@@ -17,31 +17,58 @@ const JWT_SECRET = process.env.JWT_SECRET || "petfinder-secret-key";
 const DATA_FILE = path.join(__dirname, "data", "db.json");
 const UPLOADS_DIR = path.join(__dirname, "uploads");
 
-// Ensure data and uploads directories exist
-if (!fs.existsSync(path.join(__dirname, "data"))) {
-  fs.mkdirSync(path.join(__dirname, "data"));
-}
-if (!fs.existsSync(UPLOADS_DIR)) {
-  fs.mkdirSync(UPLOADS_DIR);
-}
-if (!fs.existsSync(DATA_FILE)) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify({ users: [], lostPets: [], foundPets: [] }));
+// In-memory database fallback for Vercel/Serverless
+let memoryDB = { users: [], lostPets: [], foundPets: [] };
+
+// Ensure data and uploads directories exist (only on local/persistent servers)
+if (process.env.NODE_ENV !== "production" || !process.env.VERCEL) {
+  if (!fs.existsSync(path.join(__dirname, "data"))) {
+    fs.mkdirSync(path.join(__dirname, "data"));
+  }
+  if (!fs.existsSync(UPLOADS_DIR)) {
+    fs.mkdirSync(UPLOADS_DIR);
+  }
+  if (!fs.existsSync(DATA_FILE)) {
+    fs.writeFileSync(DATA_FILE, JSON.stringify(memoryDB));
+  } else {
+    memoryDB = JSON.parse(fs.readFileSync(DATA_FILE, "utf-8"));
+  }
 }
 
-// Multer setup
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, UPLOADS_DIR);
-  },
-  filename: (req, file, cb) => {
-    cb(null, Date.now() + "-" + file.originalname);
-  },
-});
+// Multer setup - Use memory storage for Vercel
+const storage = process.env.VERCEL 
+  ? multer.memoryStorage() 
+  : multer.diskStorage({
+      destination: (req, file, cb) => {
+        cb(null, UPLOADS_DIR);
+      },
+      filename: (req, file, cb) => {
+        cb(null, Date.now() + "-" + file.originalname);
+      },
+    });
+
 const upload = multer({ storage });
 
 // Database helpers
-const readDB = () => JSON.parse(fs.readFileSync(DATA_FILE, "utf-8"));
-const writeDB = (data: any) => fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+const readDB = () => {
+  if (process.env.VERCEL) return memoryDB;
+  try {
+    return JSON.parse(fs.readFileSync(DATA_FILE, "utf-8"));
+  } catch (e) {
+    return memoryDB;
+  }
+};
+
+const writeDB = (data: any) => {
+  memoryDB = data;
+  if (!process.env.VERCEL) {
+    try {
+      fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+    } catch (e) {
+      console.error("Failed to write to disk:", e);
+    }
+  }
+};
 
 export const app = express();
 export const httpServer = createServer(app);
@@ -98,7 +125,14 @@ async function startServer() {
   // --- Pet Routes ---
   app.post("/api/pets/report", authenticate, upload.array("images", 5), (req: any, res) => {
     const { type, petType, petName, breed, color, location, lat, lng, dateTime, contact, urgency } = req.body;
-    const images = (req.files as Express.Multer.File[]).map(f => `/uploads/${f.filename}`);
+    
+    let images: string[] = [];
+    if (process.env.VERCEL) {
+      // Convert buffers to base64 for Vercel
+      images = (req.files as any[]).map(f => `data:${f.mimetype};base64,${f.buffer.toString("base64")}`);
+    } else {
+      images = (req.files as Express.Multer.File[]).map(f => `/uploads/${f.filename}`);
+    }
     
     const db = readDB();
     const newPet = {
