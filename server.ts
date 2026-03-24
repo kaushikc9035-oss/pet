@@ -43,15 +43,15 @@ const upload = multer({ storage });
 const readDB = () => JSON.parse(fs.readFileSync(DATA_FILE, "utf-8"));
 const writeDB = (data: any) => fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
 
-async function startServer() {
-  const app = express();
-  const httpServer = createServer(app);
-  const io = new Server(httpServer, {
-    cors: {
-      origin: "*",
-    },
-  });
+export const app = express();
+export const httpServer = createServer(app);
+export const io = new Server(httpServer, {
+  cors: {
+    origin: "*",
+  },
+});
 
+async function startServer() {
   app.use(cors());
   app.use(express.json());
   app.use("/uploads", express.static(UPLOADS_DIR));
@@ -208,10 +208,16 @@ async function startServer() {
     });
   }
 
-  const PORT = 3000;
-  httpServer.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
-  });
+  const PORT = process.env.PORT || 3000;
+  
+  // Only listen if not running as a serverless function (e.g., on Vercel)
+  if (process.env.NODE_ENV !== "production" || !process.env.VERCEL) {
+    httpServer.listen(PORT, "0.0.0.0", () => {
+      console.log(`Server running on http://localhost:${PORT}`);
+    });
+  }
 }
 
 startServer();
+
+export default app;
